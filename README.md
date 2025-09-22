@@ -181,3 +181,10 @@ Dirty get the F1 score: 0.4658259993870135
 rock get the F1 score: 0.51338199513382
 ```
 
+
+## 3 Revision Notes
+For the new coreset identification methods, the related implementation is provided in `cr4ml.py`, with additional utilities in `tools/GLISTER`.
+
+For the regression task, we introduce a newly defined regression model and update the corresponding logic in `cr4ml_regression.py`, which can be executed via `run_regression.py`. The regression performance is evaluated on the housing dataset, available in `./data/housing/`.
+
+We also adopt confident learning as a new baseline, available at https://github.com/cleanlab/cleanlab.
