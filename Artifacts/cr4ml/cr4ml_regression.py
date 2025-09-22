@@ -4,7 +4,7 @@ import os
 import random
 import time
 import lightgbm as lgb
-from lightgbm import LGBMClassifier
+from lightgbm import LGBMClassifier, LGBMRegressor
 import numpy as np
 import pandas as pd
 import scipy
@@ -25,6 +25,7 @@ from deel.influenciae.influence import FirstOrderInfluenceCalculator
 from deel.influenciae.utils import ORDER
 from keras.models import Sequential
 from keras.layers import Dense, Activation
+from tensorflow.keras.layers import Dropout
 from sklearn.metrics import f1_score,precision_score,recall_score
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.models import clone_model
@@ -127,13 +128,23 @@ class CR4ML:
 
     # get preprocessor using X_train and y_train
     if self.model_name != "FTTransformer":
-      self.preprocessor = self.getPreprocessor(self.X_train, self.y_train)
-      self.X_test_embed, self.y_test_embed = self.transformData(self.preprocessor, self.X_test, self.y_test)
-      
-      self.categorical_column_dicts = self.outputshape = None
-      self.X_embed, self.y_embed = self.transformData(self.preprocessor, self.X_train, self.y_train)
-      self.train_ds = getTrainDS(self.X_embed, self.y_embed, self.batch_size)
-      self.transformerpreprocessor = None
+      if self.model_name == "RegressionTask":
+        self.preprocessor = self.getPreprocessor(self.X_train, self.y_train, is_regression=True)
+        self.X_test_embed, self.y_test_embed = self.transformData(self.preprocessor, self.X_test, self.y_test, is_regression=True)
+        
+        self.categorical_column_dicts = self.outputshape = None
+        self.X_embed, self.y_embed = self.transformData(self.preprocessor, self.X_train, self.y_train, is_regression=True)
+        self.train_ds = getTrainDS(self.X_embed, self.y_embed, self.batch_size)
+        self.transformerpreprocessor = None
+
+      else:
+        self.preprocessor = self.getPreprocessor(self.X_train, self.y_train)
+        self.X_test_embed, self.y_test_embed = self.transformData(self.preprocessor, self.X_test, self.y_test)
+        
+        self.categorical_column_dicts = self.outputshape = None
+        self.X_embed, self.y_embed = self.transformData(self.preprocessor, self.X_train, self.y_train)
+        self.train_ds = getTrainDS(self.X_embed, self.y_embed, self.batch_size)
+        self.transformerpreprocessor = None
 
     else:
       self.preprocessor = None
@@ -168,23 +179,17 @@ class CR4ML:
                                                                 self.numerical_features, self.categorical_features, self.categorical_column_dicts, self.X_train, self.outputshape) # init the model
       else:
         # unlearning
-        last_old_weights = self.model_weights[-2:]
-        epsilon = 1 / len(self.X_train)
-        last_new_weights = [last_old_weights[i] + epsilon * self.unlearning_vector[i] for i in range(len(last_old_weights))]
-
-        unlearning_weights = copy.deepcopy(self.model_weights)
-        unlearning_weights[-2:] = last_new_weights
-
-        self.model.set_weights(unlearning_weights)
-
-        # incrementally finetune
-        self.model.fit(self.train_ds, epochs=self.inc_epoch, verbose=0, shuffle = False)   
+        self.model.fit(self.train_ds, epochs=5, verbose=0, shuffle = False)   
 
       if self.model_name == "FTTransformer":
         self.losses = tf.keras.losses.categorical_crossentropy(self.y_embed, self.model(self.train_ds), from_logits=False).numpy()
+      elif self.model_name == "RegressionTask": # RMSE
+        preds = self.model(self.X_embed, training=False)
+        self.losses = tf.abs(self.y_embed - preds).numpy().flatten().tolist()
       else:
         self.losses = tf.keras.losses.categorical_crossentropy(self.y_embed, self.model(self.X_embed, training=False).numpy(), from_logits=False).numpy()
 
+        
       if iter_cnt == 0:
         pre_losses = None
         self.acuml_losses = self.losses
@@ -200,9 +205,6 @@ class CR4ML:
           else:
             X_clean_embed, y_clean_embed = self.X_embed[list(self.idxClean)], self.y_embed[list(self.idxClean)]
             self.train_clean_ds = getTrainDS(X_clean_embed, y_clean_embed, self.batch_size)
-
-        # self.sub_model.fit(self.train_clean_ds, epochs=self.inc_epoch, verbose=0, shuffle = False)
-        # self.substart = 1
       
       self.model_weights = self.model.get_weights()
 
@@ -213,7 +215,10 @@ class CR4ML:
         self.init_scores = predictProb(self.X_embed, self.model)
         self.test_scores = predictProb(self.X_test_embed, self.model)
 
-      eval_score = evalScore(self.test_scores, self.y_test_embed)['F1']
+      if self.model_name == "RegressionTask":
+        eval_score = evalScoreRegression(self.test_scores, self.y_test_embed)['RMSE']
+      else:
+        eval_score = evalScore(self.test_scores, self.y_test_embed)['F1']
       
       if iter_cnt == 0:
         self.acc_dict['initial_dirty'] = eval_score
@@ -236,6 +241,7 @@ class CR4ML:
         self.init_scores = self.init_scores
       
       ##### get coreset
+      
       if self.coreset_identifier == 'normal':
         self.idxT, self.idxV = self.getCoreset(self.temperature, self.random_state)
       elif self.coreset_identifier == 'glister':
@@ -247,8 +253,6 @@ class CR4ML:
       start_time_cr = time.time()
       self.repair_dataframe = self.cleanDataWithCR(iter_cnt, self.rock_port, False)
       self.repair_dataframe.replace('<nil>', np.nan, inplace=True)
-
-      # print("CRMethod Repair Time: ", time.time() - start_time_cr)
 
       # get the repair data
       self.X_train_repair = self.repair_dataframe.drop(self.label_column, axis=1)
@@ -275,27 +279,47 @@ class CR4ML:
 
           cr_test_ds, _, _, _, cr_y_test_embed = getTransformerDS(self.X_test, self.y_test, cr_preprocessor, self.numerical_features, self.categorical_features, self.label_column, self.batch_size)
           cr_test_scores = cr_model.predict(cr_test_ds, verbose=0)
-
+        
           cr_eval_score = evalScore(cr_test_scores, cr_y_test_embed)['F1']
           
         else:
-          cr_preprocessor = self.getPreprocessor(self.X_train_repair, self.y_train_repair)
-          cr_optimizer = Adam(learning_rate=1e-3)
-          X_repair_embed, y_repair_embed = self.transformData(cr_preprocessor, self.X_train_repair, self.y_train_repair)
-          test_X_embed_cr, test_y_embed_cr = self.transformData(cr_preprocessor, self.X_test, self.y_test)
-          train_ds_repair = getTrainDS(X_repair_embed, y_repair_embed, self.batch_size)
+
+          if self.model_name == "RegressionTask":
+            cr_preprocessor = self.getPreprocessor(self.X_train_repair, self.y_train_repair, is_regression=True)
+            cr_optimizer = Adam(learning_rate=1e-3)
+            X_repair_embed, y_repair_embed = self.transformData(cr_preprocessor, self.X_train_repair, self.y_train_repair, is_regression=True)
+            test_X_embed_cr, test_y_embed_cr = self.transformData(cr_preprocessor, self.X_test, self.y_test, is_regression=True)
+            train_ds_repair = getTrainDS(X_repair_embed, y_repair_embed, self.batch_size)
+
+          else:
+            cr_preprocessor = self.getPreprocessor(self.X_train_repair, self.y_train_repair)
+            cr_optimizer = Adam(learning_rate=1e-3)
+            X_repair_embed, y_repair_embed = self.transformData(cr_preprocessor, self.X_train_repair, self.y_train_repair)
+            test_X_embed_cr, test_y_embed_cr = self.transformData(cr_preprocessor, self.X_test, self.y_test)
+            train_ds_repair = getTrainDS(X_repair_embed, y_repair_embed, self.batch_size)
 
           cr_model, _, cr_optimizer = trainModel(train_ds_repair, X_repair_embed, y_repair_embed, self.model_name, cr_optimizer, self.no_epoch, self.random_state) # init the model
           cr_test_scores = predictProb(test_X_embed_cr, cr_model)
-          cr_eval_score = evalScore(cr_test_scores, test_y_embed_cr)['F1']
+          # cr_eval_score = evalScore(cr_test_scores, test_y_embed_cr)['F1']
+
+          if self.model_name == "RegressionTask":
+            cr_eval_score = evalScoreRegression(cr_test_scores, test_y_embed_cr)['RMSE']
+          else:
+            cr_eval_score = evalScore(cr_test_scores, test_y_embed_cr)['F1']
+
           
         self.cr_score = cr_eval_score
         self.acc_dict['cr_method'] = cr_eval_score
-            
+
+      print(self.acc_dict)
+
       # here we use the preprocessor from the raw data to continue (influential tuple and critical attr)
       # since we only train the model one time at the start, i think we should keep the preprocessor the same from start to end
       if self.model_name != "FTTransformer":
-        self.X_repair_embed, self.y_repair_embed = self.transformData(self.preprocessor, self.X_train_repair, self.y_train_repair)
+        if self.model_name == "RegressionTask":
+          self.X_repair_embed, self.y_repair_embed = self.transformData(self.preprocessor, self.X_train_repair, self.y_train_repair, is_regression=True)
+        else:
+          self.X_repair_embed, self.y_repair_embed = self.transformData(self.preprocessor, self.X_train_repair, self.y_train_repair)
       else:
         self.X_repair_embed = self.y_repair_embed = None
       
@@ -303,6 +327,7 @@ class CR4ML:
       ##### get influential tuples:    
       influ_tuples_dict = self.getInfluentialTuples(iter_cnt)
       influ_tuples_dict = dict(list(influ_tuples_dict.items())[:self.topk_inf]) # get the top-k tuples
+      influ_tuples_dict = {}
       print(f"Selected Influential Tuples Length: {len(influ_tuples_dict)}")
 
       #### get critical attrs
@@ -332,33 +357,39 @@ class CR4ML:
     else:
       self.train_clean_ds, _, _, _, _ = getTransformerDS(self.X_train, self.y_train, self.transformerpreprocessor, self.numerical_features, self.categorical_features, self.label_column, self.batch_size)
     
-    # self.sub_model.fit(self.train_clean_ds, epochs=self.inc_epoch, verbose=0, shuffle = False)
-
     # the reported model
     if self.model_name == "FTTransformer":
       self.test_scores = self.model.predict(self.test_ds, verbose=0)
       eval_score = self.acc_dict['iter_' + str(iter_cnt-1)]
     else:
       self.test_scores = predictProb(self.X_test_embed, self.model)
-      eval_score = evalScore(self.test_scores, self.y_test_embed)['F1']
+      if self.model_name == "RegressionTask":
+        eval_score = evalScoreRegression(self.test_scores, self.y_test_embed)['RMSE']
+      else:
+        eval_score = evalScore(self.test_scores, self.y_test_embed)['F1']
 
     print("-" * 60)
-    print("CR4ML get the F1 score: " + str(eval_score))
-    print("Dirty get the F1 score: " + str(self.dirty_score))
-    print(self.cr_method + " get the F1 score: " + str(self.cr_score))
+    if self.model_name == "RegressionTask":
+      print(f"Final RMSE on Test Data: {eval_score}")
+      print("Dirty get the RMSE: " + str(self.dirty_score))
+      print(self.cr_method + " get the RMSE: " + str(self.cr_score))
+    else:
+      print("CR4ML get the F1 score: " + str(eval_score))
+      print("Dirty get the F1 score: " + str(self.dirty_score))
+      print(self.cr_method + " get the F1 score: " + str(self.cr_score))
     
     return self.model
  
-  def getPreprocessor(self, X_train, y_train):
+  def getPreprocessor(self, X_train, y_train, is_regression = False):
     # get preprocessor through X and y train
     preprocessor = Preprocessor()
-    preprocessor.fit(X_train, y_train)
+    preprocessor.fit(X_train, y_train, None, is_regression)
 
     return preprocessor
   
-  def transformData(self, preprocessor, X, y):
+  def transformData(self, preprocessor, X, y, is_regression = False):
     # fit the data to get the embedding
-    X_transform, y_transform = preprocessor.transform(X, y)
+    X_transform, y_transform = preprocessor.transform(X, y, is_regression)
 
     X_transform = np.float64(X_transform)
     y_transform = np.float64(y_transform)
@@ -375,7 +406,7 @@ class CR4ML:
       init_metric = log_loss(label, scipy.special.softmax(pred, axis=1),
                               labels=list(range(pred.shape[1])))
     elif self.metric == 'rmse':
-      init_metric = mean_squared_error(label, pred, squared=False)
+      init_metric = np.sqrt(mean_squared_error(label, pred))
     elif self.metric == 'auc':
       init_metric = roc_auc_score(label, scipy.special.expit(pred))
     else:
@@ -424,6 +455,10 @@ class CR4ML:
     return idxT, idxV
 
   def getMetric(self, y_train):
+    if self.model_name == "RegressionTask":
+      self.metric = 'rmse'
+      return self.metric
+
     if len(set(y_train.values.flatten())) > 2:
       self.metric = 'multi_logloss'
     elif len(set(y_train.values.flatten())) == 2:
@@ -477,7 +512,10 @@ class CR4ML:
       val_losses = tf.keras.losses.categorical_crossentropy(y_val_embed, self.model(val_ds), from_logits=False).numpy().sum()    
     else:
       val_ds = None
-      val_losses = tf.keras.losses.categorical_crossentropy(y_val_embed, self.model(X_val_embed, training=False).numpy(), from_logits=False).numpy().sum()
+      if self.model_name == "RegressionTask":
+        val_losses = tf.sqrt(tf.reduce_mean(tf.square(y_val_embed - self.model(X_val_embed, training=False)))).numpy()
+      else:
+        val_losses = tf.keras.losses.categorical_crossentropy(y_val_embed, self.model(X_val_embed, training=False).numpy(), from_logits=False).numpy().sum()
             
     self.influence_calculator = self.getInfluenceModel()
 
@@ -503,9 +541,9 @@ class CR4ML:
 
       if self.X_train.loc[idx].equals(self.X_train_repair.loc[idx]):
         continue
-
+      
       influe_vector = reshapeInfluevector(old_weights, influe_vector_lists[idx])
-      influe_vector_repair = reshapeInfluevector(old_weights, influe_vector_repair_lists[idx]) 
+      influe_vector_repair = reshapeInfluevector(old_weights, influe_vector_repair_lists[idx])
 
       last_old_weights = old_weights[-2:]
       epsilon = 1 / len(self.X_train)
@@ -518,9 +556,13 @@ class CR4ML:
       self.model.set_weights(new_weights)
 
       if self.model_name != "FTTransformer":
-        val_update_losses = tf.keras.losses.categorical_crossentropy(y_val_embed, self.model(X_val_embed, training=False).numpy(), from_logits=False).numpy().sum()
+        if self.model_name == "RegressionTask":
+          val_update_losses = tf.sqrt(tf.reduce_mean(tf.square(y_val_embed - self.model(X_val_embed, training=False)))).numpy()
+        else:
+          val_update_losses = tf.keras.losses.categorical_crossentropy(y_val_embed, self.model(X_val_embed, training=False).numpy(), from_logits=False).numpy().sum()
       else:
         val_update_losses = tf.keras.losses.categorical_crossentropy(y_val_embed, self.model(val_ds), from_logits=False).numpy().sum()
+
 
       if val_update_losses < val_losses:
         influ_tuples_dict[idx] = val_update_losses
@@ -556,10 +598,14 @@ class CR4ML:
 
     params = {"n_estimators": 100, "importance_type": "gain", "num_leaves": 16,
                         "random_state": self.random_state, "deterministic": True, "n_jobs": n_jobs, 'verbosity': -1}
+    
     if self.metric is not None:
                   params.update({"metric": self.metric})
     
-    gbm = lgb.LGBMClassifier(**params)
+    if self.metric in ['rmse']:
+      gbm = lgb.LGBMRegressor(**params)
+    else:
+      gbm = lgb.LGBMClassifier(**params)
     
     gbm.fit(train_x_raw, train_y.values.ravel(), init_score=train_init,
                       eval_init_score=[val_init],
@@ -570,7 +616,7 @@ class CR4ML:
     if self.metric in ['auc']:
       score_raw = gbm.best_score_['valid_0'][key_raw] - init_metric
     else:
-      score_raw = init_metric - gbm.best_score_['valid_0'][key_raw]
+      score_raw = init_metric - gbm.best_score_['valid_0'][key_raw] # loss decrease
 
     parallel_data = {'X_train': self.X_train, 'X_train_repair': self.X_train_repair, 
                       'clean_flag': self.clean_flag, 
@@ -659,7 +705,11 @@ class CR4ML:
     
     if self.model_name != "FTTransformer":
       # update X_embed, y_embed, train_ds
-      self.X_embed, self.y_embed = self.transformData(self.preprocessor, self.X_train, self.y_train)
+      if self.model_name == "RegressionTask":
+        self.X_embed, self.y_embed = self.transformData(self.preprocessor, self.X_train, self.y_train, is_regression=True)
+      else:
+        self.X_embed, self.y_embed = self.transformData(self.preprocessor, self.X_train, self.y_train)
+
       self.train_ds = getTrainDS(self.X_embed, self.y_embed, self.batch_size)
     else:
       # update y_embed, train_ds
@@ -834,9 +884,6 @@ def process_candidate_attr(candidate_features, data):
   simul_X_train = asType(simul_X_train, categorical_features)
   train_x = simul_X_train.loc[idxT]
 
-  #### X_train or simul_X_train ?
-  # val_x = asType(X_train, categorical_features).loc[idxV] # coreset, suppose it clean, not use simul_X_train
-
   n_jobs = 4
 
   params = {"n_estimators": 100, "importance_type": "gain", "num_leaves": 16,
@@ -844,7 +891,10 @@ def process_candidate_attr(candidate_features, data):
   if metric is not None:
                 params.update({"metric": metric})
   
-  gbm = lgb.LGBMClassifier(**params)
+  if metric == "rmse":
+    gbm = lgb.LGBMRegressor(**params)
+  else:
+    gbm = lgb.LGBMClassifier(**params)
   
   gbm.fit(train_x, train_y.values.ravel(), init_score=train_init,
                     eval_init_score=[val_init],
@@ -859,13 +909,16 @@ def process_candidate_attr(candidate_features, data):
 
   return score
 
+def rmse(y_true, y_pred):
+    return tf.sqrt(tf.reduce_mean(tf.square(y_pred - y_true)) + 1e-8)
+
 def load_model(model_name, X_embed, y_embed, optimizer, 
                random_state, numerical_features = None, 
                categorical_features = None,
                categorical_column_dicts = None, X_train = None,
                label_card = None):
   
-  if model_name != "FTTransformer":
+  if model_name != "FTTransformer" and model_name != "RegressionTask":
     if y_embed.shape[1] > 2:
       last_activation = 'softmax'
     else:
@@ -885,14 +938,13 @@ def load_model(model_name, X_embed, y_embed, optimizer,
     model.add(Dense(y_embed.shape[1], activation=last_activation, name='last_layer'))
     model.compile(optimizer=optimizer, loss='categorical_crossentropy', metrics=['accuracy'])
 
-  elif model_name == "L2SVM":
+  elif model_name == "RegressionTask":
     tf.random.set_seed(random_state)
     model = Sequential()
-    model.add(Dense(y_embed.shape[1], input_shape=(X_embed.shape[1],),
-                    activation=None, kernel_regularizer=tf.keras.regularizers.l2(0.1), 
-                    name = "last_layer"))
-    
-    model.compile(optimizer=optimizer, loss=l2_svm_loss, metrics=['accuracy'])
+    model.add(Dense(64, input_shape=(X_embed.shape[1],), activation='relu'))
+    model.add(Dense(32, activation='relu'))
+    model.add(Dense(1, activation='linear', name='last_layer'))
+    model.compile(optimizer=optimizer, loss=rmse, metrics=[rmse])
     
   elif model_name == "FTTransformer":
     tf.random.set_seed(random_state)
@@ -955,7 +1007,10 @@ def influe_vector_cal(tuple_in_loader, influe_calculator):
     
   inf_vector = influe_calculator.compute_influence_vector(tuple_in_loader)
 
+  # print(inf_vector)
+
   for sample_id, ((sample, label), inf_val_new) in inf_vector.enumerate():
+    # print(inf_val_new)
     I_up_new_vector = inf_val_new.numpy()
 
   return I_up_new_vector
@@ -964,6 +1019,14 @@ def getTrainDS(X, y, batch_size):
   tensordata = tf.data.Dataset.from_tensor_slices((X, y))
   train_ds = tensordata.batch(batch_size)
   return train_ds
+
+def evalScoreRegression(pred_scores, y_true):
+  try:
+    rmse = np.sqrt(mean_squared_error(y_true, pred_scores))
+    score = {'RMSE': rmse}
+  except:
+    score = {'RMSE': -1}
+  return score
 
 def evalScore(pred_scores, y_embed):
   y_pred = np.argmax(pred_scores, axis=1)
@@ -987,7 +1050,6 @@ def reshapeInfluevector(model_weights, influe_vector):
     y = x + i_copy.shape[0]
     vec_slice = influe_vector_flatten[x:y]
     vec_slice = np.reshape(vec_slice, i.shape)
-    # print(vec_slice.shape)
     x = y
     
     inf_weight_reshape.append(vec_slice)
@@ -1035,11 +1097,11 @@ def glister_coreset(
   num_features: list,
   line_num: int,
   budget_ratio: float = 0.2,     
-  val_ratio: float = 0.2,       
+  val_ratio: float = 0.2,        
   random_state: int = 42,
   standardize: bool = True,
-  eta: float = 0.05,        
-  warmup_epochs: int = 0, 
+  eta: float = 0.05,            
+  warmup_epochs: int = 0,       
   lr: float = 0.1,
   device: str = "cuda" if torch.cuda.is_available() else "cpu",
 ):
@@ -1075,13 +1137,13 @@ def glister_coreset(
     X_trn = scaler.transform(X_trn).astype(np.float32)
     X_val = scaler.transform(X_val).astype(np.float32)
 
- 
+  
   X_trn_t = torch.from_numpy(X_trn).to(device)
   y_trn_t = torch.from_numpy(y_trn.astype(np.int64)).to(device)
   X_val_t = torch.from_numpy(X_val).to(device)
   y_val_t = torch.from_numpy(y_val.astype(np.int64)).to(device)
 
-
+ 
   num_features = X_trn.shape[1]
   num_classes = int(np.max(y) + 1) if np.issubdtype(y.dtype, np.integer) else len(np.unique(y))
   model = LogisticRegNet(num_features, num_classes).to(device)
@@ -1090,7 +1152,7 @@ def glister_coreset(
   loss_nored = nn.CrossEntropyLoss(reduction="none")
   optimizer = torch.optim.SGD(model.parameters(), lr=lr)
 
-
+ 
   if warmup_epochs > 0:
     model.train()
     for _ in range(warmup_epochs):
@@ -1102,7 +1164,7 @@ def glister_coreset(
 
   theta_init = {k: v.detach().clone() for k, v in model.state_dict().items()}
 
-
+ 
   setfun = SetFunctionBatch(
     X_trn=X_trn_t, Y_trn=y_trn_t,
     X_val=X_val_t, Y_val=y_val_t,
@@ -1111,13 +1173,10 @@ def glister_coreset(
     loss_nored=loss_nored,
     eta=eta
   )
-
-
+  
   budget = int(max(1, round(budget_ratio * len(X_trn))))
-
   selected_local_idx, _ = setfun.lazy_greedy_max_2(budget, theta_init)
   selected_local_idx = np.array(selected_local_idx, dtype=int)
-
 
   idxV = idx_trn[selected_local_idx]
   

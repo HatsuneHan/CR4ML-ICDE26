@@ -19,7 +19,12 @@ class Preprocessor(object):
         self.cat_imputer = SimpleImputer(strategy="constant", fill_value="missing", add_indicator=True)
         self.label_enc = LabelEncoder()
 
-    def fit(self, X_train, y_train, X_full=None):
+        self.label_num_transformer = Pipeline(steps=[
+            ('imputer', SimpleImputer(strategy=num_strategy, add_indicator=True)),
+            ('scaler', MinMaxScaler())
+        ])
+
+    def fit(self, X_train, y_train, X_full=None, is_regression=False):
         self.num_features = X_train.select_dtypes(include='number').columns
         self.cat_features = X_train.select_dtypes(exclude='number').columns
         self.class_feature = y_train.columns
@@ -45,9 +50,13 @@ class Preprocessor(object):
                 ('onehot', self.feature_enc)
             ])
 
-        self.label_enc.fit(y_train.values.ravel())
+        if not is_regression:
+            self.label_enc.fit(y_train.values.ravel())
+        else:
+            self.label_num_transformer.fit(y_train.values)
+           
 
-    def transform(self, X=None, y=None):
+    def transform(self, X=None, y=None, is_regression=False):
         if X is not None:
             X_after = []
             if len(self.num_features) > 0:
@@ -66,11 +75,16 @@ class Preprocessor(object):
                 X_after.append(X_cat.toarray())
 
             X = np.hstack(X_after)
+           
 
         if y is not None:
-            y = np.array(y).ravel()
-            y = self.label_enc.transform(y).astype(np.int32)
-            y = to_categorical(y)
+            if not is_regression:
+                y = np.array(y).ravel()
+                y = self.label_enc.transform(y).astype(np.int32)
+                y = to_categorical(y)
+            else:
+                y = self.label_num_transformer.transform(y)
+
         if X is None:
             return y
         elif y is None:

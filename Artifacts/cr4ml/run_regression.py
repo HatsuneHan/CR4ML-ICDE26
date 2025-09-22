@@ -1,7 +1,7 @@
 import argparse
 import os
 
-from cr4ml import CR4ML
+from cr4ml_regression import CR4ML
 import pandas as pd
 import time
 
@@ -40,7 +40,7 @@ if __name__ == "__main__":
   dataset_label_dict = {"adult": "income", "nursery": "final evaluation", 
                         "default": "default.payment.next.month", "Bank": "y",
                         "german": "class", "road_safety": "SexofDriver",
-                        "Bank_bim": "y", "Bank_deepfool": "y"}
+                        "Bank_bim": "y", "Bank_deepfool": "y", "housing": "median_house_value"}
 
   base_dir = os.path.join(root_dir, dataset_name, 'exp')
 

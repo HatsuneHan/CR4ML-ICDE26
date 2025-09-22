@@ -1,0 +1,10 @@
+{
+    "dataset": "housing",
+    "mv_type": "real",
+    "train/val/test": "12384/4128/4128",
+    "num_feature": 9,
+    "percent_mv_cells": 1.7944300890037325e-05,
+    "percent_mv_rows": 0.00016149870801033592,
+    "mv_columns": "total_bedrooms(num), ",
+    "seed": 42
+}
